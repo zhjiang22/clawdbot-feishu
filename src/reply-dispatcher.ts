@@ -20,7 +20,6 @@ import type { FeishuConfig } from "./types.js";
 import {
   addTypingIndicator,
   removeTypingIndicator,
-  addDoneReaction,
   type TypingIndicatorState,
 } from "./typing.js";
 
@@ -459,9 +458,6 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         });
       }
       typingCallbacks.onIdle?.();
-      if (replyToMessageId) {
-        addDoneReaction({ cfg, messageId: replyToMessageId }).catch(() => {});
-      }
     },
   };
 

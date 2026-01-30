@@ -5,7 +5,7 @@ import { createFeishuClient } from "./client.js";
 // Feishu emoji types for typing indicator
 // See: https://open.feishu.cn/document/server-docs/im-v1/message-reaction/emojis-introduce
 // Full list: https://github.com/go-lark/lark/blob/main/emoji.go
-const TYPING_EMOJI = "THUMBSUP"; // Typing indicator emoji
+const TYPING_EMOJI = "Get"; // Typing indicator emoji
 const DONE_EMOJI = "DONE"; // Completion indicator emoji
 
 export type TypingIndicatorState = {
@@ -70,6 +70,16 @@ export async function removeTypingIndicator(params: {
   } catch (err) {
     // Silently fail - cleanup is not critical
     console.log(`[feishu] failed to remove typing indicator: ${err}`);
+  }
+
+  // Add DONE reaction right after removing typing indicator
+  try {
+    await client.im.messageReaction.create({
+      path: { message_id: state.messageId },
+      data: { reaction_type: { emoji_type: DONE_EMOJI } },
+    });
+  } catch {
+    // Not critical
   }
 }
 
