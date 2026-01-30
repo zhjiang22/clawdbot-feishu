@@ -5,7 +5,8 @@ import { createFeishuClient } from "./client.js";
 // Feishu emoji types for typing indicator
 // See: https://open.feishu.cn/document/server-docs/im-v1/message-reaction/emojis-introduce
 // Full list: https://github.com/go-lark/lark/blob/main/emoji.go
-const TYPING_EMOJI = "Typing"; // Typing indicator emoji
+const TYPING_EMOJI = "THUMBSUP"; // Typing indicator emoji
+const DONE_EMOJI = "DONE"; // Completion indicator emoji
 
 export type TypingIndicatorState = {
   messageId: string;
@@ -37,9 +38,9 @@ export async function addTypingIndicator(params: {
 
     const reactionId = (response as any)?.data?.reaction_id ?? null;
     return { messageId, reactionId };
-  } catch (err) {
-    // Silently fail - typing indicator is not critical
-    console.log(`[feishu] failed to add typing indicator: ${err}`);
+  } catch (err: any) {
+    const detail = err?.response?.data ? JSON.stringify(err.response.data) : String(err);
+    console.log(`[feishu] failed to add typing indicator: ${detail}`);
     return { messageId, reactionId: null };
   }
 }
@@ -69,5 +70,27 @@ export async function removeTypingIndicator(params: {
   } catch (err) {
     // Silently fail - cleanup is not critical
     console.log(`[feishu] failed to remove typing indicator: ${err}`);
+  }
+}
+
+/**
+ * Add a DONE reaction to the original message after reply completes.
+ */
+export async function addDoneReaction(params: {
+  cfg: ClawdbotConfig;
+  messageId: string;
+}): Promise<void> {
+  const { cfg, messageId } = params;
+  const feishuCfg = cfg.channels?.feishu as FeishuConfig | undefined;
+  if (!feishuCfg) return;
+
+  const client = createFeishuClient(feishuCfg);
+  try {
+    await client.im.messageReaction.create({
+      path: { message_id: messageId },
+      data: { reaction_type: { emoji_type: DONE_EMOJI } },
+    });
+  } catch {
+    // Not critical
   }
 }

@@ -42,6 +42,15 @@ const BlockStreamingCoalesceSchema = z
   .strict()
   .optional();
 
+const StreamingSchema = z
+  .object({
+    enabled: z.boolean().optional(),
+    patchIntervalMs: z.number().int().positive().optional(),
+    cursor: z.boolean().optional(),
+  })
+  .strict()
+  .optional();
+
 const ChannelHeartbeatVisibilitySchema = z
   .object({
     visibility: z.enum(["visible", "hidden"]).optional(),
@@ -90,6 +99,7 @@ export const FeishuConfigSchema = z
     mediaMaxMb: z.number().positive().optional(),
     heartbeat: ChannelHeartbeatVisibilitySchema,
     renderMode: RenderModeSchema, // raw = plain text (default), card = interactive card with markdown
+    streaming: StreamingSchema, // streaming card patch config
   })
   .strict()
   .superRefine((value, ctx) => {

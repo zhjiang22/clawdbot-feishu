@@ -620,7 +620,7 @@ export async function handleFeishuMessage(params: {
       ...mediaPayload,
     });
 
-    const { dispatcher, replyOptions, markDispatchIdle } = createFeishuReplyDispatcher({
+    const { dispatcherOptions, replyOptions, markDispatchIdle } = createFeishuReplyDispatcher({
       cfg,
       agentId: route.agentId,
       runtime: runtime as RuntimeEnv,
@@ -630,10 +630,10 @@ export async function handleFeishuMessage(params: {
 
     log(`feishu: dispatching to agent (session=${route.sessionKey})`);
 
-    const { queuedFinal, counts } = await core.channel.reply.dispatchReplyFromConfig({
+    const { queuedFinal } = await core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
       ctx: ctxPayload,
       cfg,
-      dispatcher,
+      dispatcherOptions,
       replyOptions,
     });
 
@@ -647,7 +647,7 @@ export async function handleFeishuMessage(params: {
       });
     }
 
-    log(`feishu: dispatch complete (queuedFinal=${queuedFinal}, replies=${counts.final})`);
+    log(`feishu: dispatch complete (queuedFinal=${queuedFinal})`);
   } catch (err) {
     error(`feishu: failed to dispatch message: ${String(err)}`);
   }
