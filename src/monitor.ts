@@ -71,12 +71,31 @@ async function monitorWebSocket(params: {
 
   const chatHistories = new Map<string, HistoryEntry[]>();
 
+  // Dedup: track recently processed message IDs to ignore re-delivered events
+  const DEDUP_TTL_MS = 5 * 60 * 1000; // 5 minutes
+  const processedMessages = new Map<string, number>();
+
   const eventDispatcher = createEventDispatcher(feishuCfg);
 
   eventDispatcher.register({
     "im.message.receive_v1": async (data) => {
       try {
         const event = data as unknown as FeishuMessageEvent;
+        const msgId = event.message?.message_id;
+        if (msgId) {
+          const now = Date.now();
+          if (processedMessages.has(msgId)) {
+            log(`feishu: ignoring duplicate message ${msgId}`);
+            return;
+          }
+          processedMessages.set(msgId, now);
+          // Prune old entries periodically
+          if (processedMessages.size > 500) {
+            for (const [id, ts] of processedMessages) {
+              if (now - ts > DEDUP_TTL_MS) processedMessages.delete(id);
+            }
+          }
+        }
         await handleFeishuMessage({
           cfg,
           event,

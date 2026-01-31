@@ -15,6 +15,7 @@ import {
   sendMessageFeishu,
   sendCardFeishu,
   updateCardFeishu,
+  buildMarkdownCard,
 } from "./send.js";
 import type { FeishuConfig } from "./types.js";
 import {
@@ -74,23 +75,29 @@ function extractToolArgs(
   maxLen: number,
 ): string {
   if (!args) return "";
+  let raw = "";
   const keys = TOOL_ARG_EXTRACTORS[name.toLowerCase()];
   if (keys) {
     for (const key of keys) {
       const val = args[key];
       if (typeof val === "string" && val.trim()) {
-        const trimmed = val.trim();
-        return trimmed.length > maxLen ? trimmed.slice(0, maxLen) + "…" : trimmed;
+        raw = val.trim();
+        break;
       }
     }
   }
-  for (const val of Object.values(args)) {
-    if (typeof val === "string" && val.trim()) {
-      const trimmed = val.trim();
-      return trimmed.length > maxLen ? trimmed.slice(0, maxLen) + "…" : trimmed;
+  if (!raw) {
+    for (const val of Object.values(args)) {
+      if (typeof val === "string" && val.trim()) {
+        raw = val.trim();
+        break;
+      }
     }
   }
-  return "";
+  if (!raw) return "";
+  const trimmed = raw.length > maxLen ? raw.slice(0, maxLen) + "…" : raw;
+  // Replace backticks to avoid breaking inline code wrapping
+  return trimmed.replace(/`/g, "'");
 }
 
 // --- Thinking/Tool state for streaming card ---
@@ -118,11 +125,11 @@ function buildThinkingSection(
     for (const t of completedTools.slice(-10)) {
       const icon = t.failed ? "❌" : "✅";
       const argStr = extractToolArgs(t.name, t.args, 150);
-      parts.push(argStr ? `${icon} \`${t.name}\` ${argStr}` : `${icon} \`${t.name}\``);
+      parts.push(argStr ? `${icon} \`${t.name}\` \`${argStr}\`` : `${icon} \`${t.name}\``);
     }
     for (const [, t] of activeTools) {
       const argStr = extractToolArgs(t.name, t.args, 150);
-      parts.push(argStr ? `⏳ \`${t.name}\` ${argStr}` : `⏳ \`${t.name}\``);
+      parts.push(argStr ? `⏳ \`${t.name}\` \`${argStr}\`` : `⏳ \`${t.name}\``);
     }
   }
 
@@ -253,6 +260,21 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
   let hasThinkingContent = false;
   let thinkingStartedAt: number | undefined;
 
+  // --- Thinking timer ---
+  let thinkingTimer: ReturnType<typeof setInterval> | null = null;
+
+  function startThinkingTimer() {
+    if (thinkingTimer) return;
+    thinkingTimer = setInterval(() => {
+      if (thinkingStopped || streamingFailed || !cardMessageId) return;
+      void patchCard(false);
+    }, 1000);
+  }
+
+  function stopThinkingTimer() {
+    if (thinkingTimer) { clearInterval(thinkingTimer); thinkingTimer = null; }
+  }
+
   // --- Unified card helpers ---
 
   function buildCurrentCard(isFinal: boolean): Record<string, unknown> {
@@ -264,10 +286,14 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
 
     const collapseSummary = buildThinkingCollapseSummary(completedTools, thinkingStartedAt);
 
+    const thinkingElapsed = thinkingStartedAt && !thinkingStopped
+      ? `🧠 Thinking… ${((Date.now() - thinkingStartedAt) / 1000).toFixed(0)}s`
+      : "🧠 Thinking…";
+
     return buildUnifiedCard({
       thinkingMarkdown: hasThinking ? (thinkingMd || "🧠 Thinking…") : undefined,
       thinkingExpanded: !thinkingStopped,
-      thinkingTitle: thinkingStopped ? collapseSummary : "🧠 Thinking…",
+      thinkingTitle: thinkingStopped ? collapseSummary : thinkingElapsed,
       replyMarkdown: replyMd || (!hasThinking ? "🧠 **Thinking…**" : undefined),
     });
   }
@@ -329,6 +355,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     if (thinkingStopped) return;
     hasThinkingContent = true;
     if (!thinkingStartedAt) thinkingStartedAt = Date.now();
+    startThinkingTimer();
     _dbg(`triggerThinkingUpdate: cardId=${cardMessageId} creationPending=${!!cardCreationPromise} tools=${activeTools.size}/${completedTools.length}`);
     if (Date.now() - lastPatchTime >= DEFAULT_THINKING_UPDATE_INTERVAL_MS) {
       void patchCard(false);
@@ -340,6 +367,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
   async function collapseThinking() {
     _dbg(`collapseThinking: cardId=${cardMessageId} hasThinking=${hasThinkingContent}`);
     thinkingStopped = true;
+    stopThinkingTimer();
     clearPendingPatch();
     if (!cardMessageId || !hasThinkingContent) return;
     await patchCard(false);
@@ -348,24 +376,35 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
   // --- Non-streaming fallback ---
 
   async function deliverStandalone(text: string) {
-    // Always use card v2 for consistent markdown rendering
-    const card = buildUnifiedCard({
+    // Try v2 card first (supports markdown table rendering), then v1, then plain text
+    const cardV2 = buildUnifiedCard({
       thinkingMarkdown: undefined,
       thinkingExpanded: false,
       thinkingTitle: "",
       replyMarkdown: text,
     });
     try {
-      const result = await sendCardFeishu({ cfg, to: chatId, card, replyToMessageId });
+      // Use create (no replyToMessageId) — reply API may reject v2 cards with tables
+      const result = await sendCardFeishu({ cfg, to: chatId, card: cardV2 });
       _dbg(`deliverStandalone: sent card v2 id=${result.messageId}`);
+      return;
     } catch (err) {
-      _dbg(`deliverStandalone: card v2 failed, fallback text: ${String(err)}`);
-      // Last resort: plain text
-      const converted = core.channel.text.convertMarkdownTables(text, tableMode);
-      const chunks = core.channel.text.chunkTextWithMode(converted, textChunkLimit, chunkMode);
-      for (const chunk of chunks) {
-        await sendMessageFeishu({ cfg, to: chatId, text: chunk, replyToMessageId });
-      }
+      _dbg(`deliverStandalone: card v2 failed: ${String(err)}`);
+    }
+    // Fallback: v1 card (no table rendering but at least shows content)
+    try {
+      const card = buildMarkdownCard(text);
+      const result = await sendCardFeishu({ cfg, to: chatId, card, replyToMessageId });
+      _dbg(`deliverStandalone: sent card v1 id=${result.messageId}`);
+      return;
+    } catch (err) {
+      _dbg(`deliverStandalone: card v1 failed, fallback text: ${String(err)}`);
+    }
+    // Last resort: plain text
+    const converted = core.channel.text.convertMarkdownTables(text, tableMode);
+    const chunks = core.channel.text.chunkTextWithMode(converted, textChunkLimit, chunkMode);
+    for (const chunk of chunks) {
+      await sendMessageFeishu({ cfg, to: chatId, text: chunk, replyToMessageId });
     }
   }
 
@@ -374,13 +413,47 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
    * (adding reply below collapsed thinking), or send a new card if none exists.
    */
   let standaloneDelivered = false;
+  let deliverInFlight: Promise<void> | null = null;
 
   /** Deliver all accumulated reply text — patches card with full text (idempotent). */
   async function doDeliverFinalReply() {
+    if (deliverInFlight) {
+      _dbg(`doDeliverFinalReply: reusing in-flight delivery`);
+      return deliverInFlight;
+    }
+    deliverInFlight = doDeliverFinalReplyInner().finally(() => { deliverInFlight = null; });
+    return deliverInFlight;
+  }
+
+  async function doDeliverFinalReplyInner() {
     const fullText = accumulatedText;
     if (!fullText.trim()) return;
 
     _dbg(`doDeliverFinalReply: len=${fullText.length} cardId=${cardMessageId}`);
+
+    // If reply contains a markdown table, skip v2 card patch (causes 400)
+    // and send as standalone v1 card instead
+    if (cardMessageId && hasMarkdownTable(fullText)) {
+      _dbg(`doDeliverFinalReply: table detected, skipping v2 patch, sending v1 standalone`);
+      thinkingStopped = true;
+      // Collapse thinking on existing card (without reply text)
+      try {
+        const thinkingOnly = buildUnifiedCard({
+          thinkingMarkdown: hasThinkingContent
+            ? (buildThinkingSection(thinkingText, activeTools, completedTools, 3000) || "🧠 Thinking…")
+            : undefined,
+          thinkingExpanded: false,
+          thinkingTitle: buildThinkingCollapseSummary(completedTools, thinkingStartedAt),
+          replyMarkdown: undefined,
+        });
+        await updateCardFeishu({ cfg, messageId: cardMessageId, card: thinkingOnly });
+      } catch { /* best effort */ }
+      if (!standaloneDelivered) {
+        standaloneDelivered = true;
+        await deliverStandalone(fullText);
+      }
+      return;
+    }
 
     if (cardMessageId) {
       thinkingStopped = true;
@@ -422,6 +495,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
       // Collapse thinking on first reply content
       if (!thinkingStopped) {
         thinkingStopped = true;
+        stopThinkingTimer();
         clearPendingPatch();
       }
 
@@ -443,12 +517,14 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     },
     onError: (err: unknown, info: { kind: string }) => {
       params.runtime.error?.(`feishu ${info.kind} reply failed: ${String(err)}`);
+      stopThinkingTimer();
       clearPendingPatch();
       typingCallbacks.onIdle?.();
     },
     onReplyStart: typingCallbacks.onReplyStart,
     onIdle: () => {
       _dbg(`onIdle: accumulated=${accumulatedText.length}`);
+      stopThinkingTimer();
       clearPendingPatch();
       thinkingStopped = true;
       // Fallback: deliver any remaining accumulated text
@@ -498,6 +574,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     dispatcherOptions,
     replyOptions,
     markDispatchIdle: () => {
+      stopThinkingTimer();
       clearPendingPatch();
       if (!thinkingStopped) {
         thinkingStopped = true;
