@@ -37,6 +37,11 @@ function forceStopWSClient(client: Lark.WSClient, log: (...args: any[]) => void)
     const c = client as any;
     if (c.pingInterval) { clearTimeout(c.pingInterval); c.pingInterval = undefined; }
     if (c.reconnectInterval) { clearTimeout(c.reconnectInterval); c.reconnectInterval = undefined; }
+    // Disable auto-reconnect BEFORE terminating, otherwise the SDK's
+    // on('close') handler calls reConnect() immediately.
+    if (c.wsConfig) {
+      try { c.wsConfig.updateWs({ autoReconnect: false }); } catch {}
+    }
     // terminate underlying WebSocket
     const ws = c.wsConfig?.getWSInstance?.();
     if (ws && typeof ws.terminate === "function") ws.terminate();
