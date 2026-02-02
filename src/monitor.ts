@@ -16,6 +16,17 @@ export type MonitorFeishuOpts = {
 let currentWsClient: Lark.WSClient | null = null;
 let botOpenId: string | undefined;
 
+// Module-level dedup state: survives WSClient reconnections and monitor restarts
+const DEDUP_TTL_MS = 60 * 60 * 1000; // 60 minutes
+const processedMessages = new Map<string, number>();
+let activeSessionId = 0;
+
+function pruneProcessedMessages(now: number): void {
+  for (const [id, ts] of processedMessages) {
+    if (now - ts > DEDUP_TTL_MS) processedMessages.delete(id);
+  }
+}
+
 async function fetchBotOpenId(cfg: FeishuConfig): Promise<string | undefined> {
   try {
     const result = await probeFeishu(cfg);
@@ -64,6 +75,15 @@ async function monitorWebSocket(params: {
   const log = runtime?.log ?? console.log;
   const error = runtime?.error ?? console.error;
 
+  // Invalidate any previous WSClient session so its handlers become no-ops
+  activeSessionId++;
+  const mySessionId = activeSessionId;
+
+  if (currentWsClient) {
+    log("feishu: stopping previous WebSocket client before starting new one");
+    currentWsClient = null;
+  }
+
   log("feishu: starting WebSocket connection...");
 
   const wsClient = createFeishuWSClient(feishuCfg);
@@ -71,15 +91,14 @@ async function monitorWebSocket(params: {
 
   const chatHistories = new Map<string, HistoryEntry[]>();
 
-  // Dedup: track recently processed message IDs to ignore re-delivered events
-  const DEDUP_TTL_MS = 5 * 60 * 1000; // 5 minutes
-  const processedMessages = new Map<string, number>();
-
   const eventDispatcher = createEventDispatcher(feishuCfg);
 
   eventDispatcher.register({
     "im.message.receive_v1": async (data) => {
       try {
+        // Stale session guard: skip if a newer monitor has started
+        if (mySessionId !== activeSessionId) return;
+
         const event = data as unknown as FeishuMessageEvent;
         const msgId = event.message?.message_id;
         if (msgId) {
@@ -89,12 +108,7 @@ async function monitorWebSocket(params: {
             return;
           }
           processedMessages.set(msgId, now);
-          // Prune old entries periodically
-          if (processedMessages.size > 500) {
-            for (const [id, ts] of processedMessages) {
-              if (now - ts > DEDUP_TTL_MS) processedMessages.delete(id);
-            }
-          }
+          if (processedMessages.size > 200) pruneProcessedMessages(now);
         }
         await handleFeishuMessage({
           cfg,
@@ -164,6 +178,7 @@ async function monitorWebSocket(params: {
 }
 
 export function stopFeishuMonitor(): void {
+  activeSessionId++; // invalidate all running handlers
   if (currentWsClient) {
     currentWsClient = null;
   }
