@@ -27,6 +27,26 @@ function pruneProcessedMessages(now: number): void {
   }
 }
 
+/**
+ * Force-kill a WSClient by clearing its internal timers and terminating the
+ * underlying WebSocket.  The SDK exposes no public stop() method, so we reach
+ * into private fields.  Wrapped in try/catch so a SDK update won't break us.
+ */
+function forceStopWSClient(client: Lark.WSClient, log: (...args: any[]) => void): void {
+  try {
+    const c = client as any;
+    if (c.pingInterval) { clearTimeout(c.pingInterval); c.pingInterval = undefined; }
+    if (c.reconnectInterval) { clearTimeout(c.reconnectInterval); c.reconnectInterval = undefined; }
+    // terminate underlying WebSocket
+    const ws = c.wsConfig?.getWSInstance?.();
+    if (ws && typeof ws.terminate === "function") ws.terminate();
+    else if (ws && typeof ws.close === "function") ws.close();
+    log("feishu: previous WSClient force-stopped");
+  } catch (err) {
+    log(`feishu: best-effort WSClient cleanup failed: ${String(err)}`);
+  }
+}
+
 async function fetchBotOpenId(cfg: FeishuConfig): Promise<string | undefined> {
   try {
     const result = await probeFeishu(cfg);
@@ -81,6 +101,7 @@ async function monitorWebSocket(params: {
 
   if (currentWsClient) {
     log("feishu: stopping previous WebSocket client before starting new one");
+    forceStopWSClient(currentWsClient, log);
     currentWsClient = null;
   }
 
@@ -145,6 +166,7 @@ async function monitorWebSocket(params: {
   return new Promise((resolve, reject) => {
     const cleanup = () => {
       if (currentWsClient === wsClient) {
+        forceStopWSClient(wsClient, log);
         currentWsClient = null;
       }
     };
@@ -177,9 +199,10 @@ async function monitorWebSocket(params: {
   });
 }
 
-export function stopFeishuMonitor(): void {
+export function stopFeishuMonitor(log?: (...args: any[]) => void): void {
   activeSessionId++; // invalidate all running handlers
   if (currentWsClient) {
+    forceStopWSClient(currentWsClient, log ?? console.log);
     currentWsClient = null;
   }
 }
