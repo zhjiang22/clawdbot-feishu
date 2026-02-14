@@ -118,10 +118,196 @@ function parseMessageContent(content: string, messageType: string): string {
       const { textContent } = parsePostContent(content);
       return textContent;
     }
+    if (messageType === "merge_forward") {
+      return "[合并转发消息]";
+    }
     return content;
   } catch {
     return content;
   }
+}
+
+/**
+ * Parse a single sub-message body based on its type.
+ */
+function parseSubMessageText(msgType: string, content: string): string {
+  switch (msgType) {
+    case "text":
+      try {
+        return JSON.parse(content).text ?? content;
+      } catch {
+        return content;
+      }
+    case "post":
+      return parsePostContent(content).textContent;
+    case "image":
+      return "[图片]";
+    case "file":
+      return "[文件]";
+    case "audio":
+      return "[语音]";
+    case "video":
+      return "[视频]";
+    case "sticker":
+      return "[表情]";
+    case "merge_forward":
+      return "[合并转发消息]";
+    default:
+      return `[${msgType}]`;
+  }
+}
+
+/**
+ * Fetch and format sub-messages from a merge_forward (合并转发) message.
+ *
+ * Strategy:
+ *  1. im.message.get on the merge_forward message — check if items[] has sub-messages
+ *  2. im.message.list with container_id_type=chat, filter by upper_message_id
+ *  3. Fallback: return placeholder with guidance
+ */
+async function resolveMergeForwardContent(params: {
+  cfg: ClawdbotConfig;
+  messageId: string;
+  chatId: string;
+  rawContent: string;
+  log: (...args: any[]) => void;
+}): Promise<string> {
+  const { cfg, messageId, chatId, rawContent, log } = params;
+  const feishuCfg = cfg.channels?.feishu as FeishuConfig | undefined;
+  if (!feishuCfg) return "[合并转发消息]";
+
+  log(`feishu: merge_forward raw content (${messageId}): ${rawContent.slice(0, 500)}`);
+
+  type SubMessage = {
+    msg_type?: string;
+    body?: { content: string };
+    sender?: { id: string; id_type: string; sender_type: string };
+    create_time?: string;
+    upper_message_id?: string;
+  };
+
+  const client = createFeishuClient(feishuCfg);
+
+  // ---------- Strategy 1: im.message.get — might return sub-messages in items[] ----------
+  try {
+    const response: any = await client.im.message.get({
+      path: { message_id: messageId },
+    });
+
+    if (response.code === 0 && response.data?.items) {
+      const items: SubMessage[] = response.data.items;
+      log(`feishu: merge_forward get returned ${items.length} item(s), keys: ${JSON.stringify(Object.keys(response.data))}`);
+
+      // If items has more than 1 entry, the extra ones may be sub-messages
+      const subItems = items.filter(
+        (it) => it.msg_type !== "merge_forward" || it.upper_message_id === messageId,
+      );
+      // Also check: even the single item might carry sub-message data in body.content
+      if (items.length === 1) {
+        const body = items[0]?.body?.content ?? "";
+        log(`feishu: merge_forward single item body (first 500): ${body.slice(0, 500)}`);
+      }
+
+      if (subItems.length > 0 && subItems.some((it) => it.msg_type !== "merge_forward")) {
+        const formatted = await formatSubMessages(subItems, feishuCfg, log);
+        log(`feishu: resolved merge_forward via get API with ${subItems.length} sub-message(s)`);
+        return formatted;
+      }
+    } else {
+      log(`feishu: merge_forward get returned code ${response.code}: ${response.msg}`);
+    }
+  } catch (err) {
+    log(`feishu: merge_forward get API failed: ${String(err)}`);
+  }
+
+  // ---------- Strategy 2: list chat messages, filter by upper_message_id ----------
+  try {
+    const response: any = await client.im.message.list({
+      params: {
+        container_id_type: "chat",
+        container_id: chatId,
+        page_size: 50,
+        sort_type: "ByCreateTimeDesc" as const,
+      },
+    });
+
+    if (response.code === 0 && response.data?.items) {
+      const items: SubMessage[] = response.data.items;
+      const subItems = items.filter((it) => it.upper_message_id === messageId);
+      log(`feishu: chat list returned ${items.length} messages, ${subItems.length} have upper_message_id matching`);
+
+      if (subItems.length > 0) {
+        const formatted = await formatSubMessages(subItems, feishuCfg, log);
+        log(`feishu: resolved merge_forward via chat list with ${subItems.length} sub-message(s)`);
+        return formatted;
+      }
+    } else {
+      log(`feishu: merge_forward chat list returned code ${response.code}: ${response.msg}`);
+    }
+  } catch (err) {
+    log(`feishu: merge_forward chat list failed: ${String(err)}`);
+  }
+
+  log(`feishu: merge_forward could not be resolved for ${messageId}`);
+  return "[合并转发消息 - 无法解析子消息内容，请尝试复制粘贴或截图发送]";
+}
+
+/**
+ * Format a Feishu timestamp (ms string) into "MM-DD HH:mm".
+ */
+function formatFeishuTime(createTime?: string): string {
+  if (!createTime) return "";
+  const ms = parseInt(createTime, 10);
+  if (Number.isNaN(ms)) return "";
+  const d = new Date(ms);
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  const hh = String(d.getHours()).padStart(2, "0");
+  const min = String(d.getMinutes()).padStart(2, "0");
+  return `${mm}-${dd} ${hh}:${min}`;
+}
+
+/**
+ * Format an array of sub-messages into readable text with sender names and timestamps.
+ */
+async function formatSubMessages(
+  items: Array<{
+    msg_type?: string;
+    body?: { content: string };
+    sender?: { id: string; id_type: string; sender_type: string };
+    create_time?: string;
+  }>,
+  feishuCfg: FeishuConfig,
+  log: (...args: any[]) => void,
+): Promise<string> {
+  // Resolve sender names (best-effort, deduplicated)
+  const senderNames = new Map<string, string>();
+  const uniqueOpenIds = new Set<string>();
+  for (const item of items) {
+    if (item.sender?.id_type === "open_id" && item.sender.id) {
+      uniqueOpenIds.add(item.sender.id);
+    }
+  }
+  await Promise.all(
+    [...uniqueOpenIds].map(async (openId) => {
+      const name = await resolveFeishuSenderName({ feishuCfg, senderOpenId: openId, log });
+      if (name) senderNames.set(openId, name);
+    }),
+  );
+
+  const lines: string[] = ["[合并转发消息]"];
+  for (const item of items) {
+    const msgType = item.msg_type ?? "text";
+    const content = item.body?.content ?? "";
+    const senderId = item.sender?.id ?? "unknown";
+    const speaker =
+      (item.sender?.id_type === "open_id" && senderNames.get(senderId)) || senderId;
+    const text = parseSubMessageText(msgType, content);
+    const time = formatFeishuTime(item.create_time);
+    lines.push(time ? `- [${time}] ${speaker}: ${text}` : `- ${speaker}: ${text}`);
+  }
+
+  return lines.join("\n");
 }
 
 function checkBotMentioned(event: FeishuMessageEvent, botOpenId?: string): boolean {
@@ -435,6 +621,18 @@ export async function handleFeishuMessage(params: {
     log,
   });
   if (senderName) ctx = { ...ctx, senderName };
+
+  // Resolve merge_forward sub-messages before policy checks
+  if (event.message.message_type === "merge_forward") {
+    const mergeContent = await resolveMergeForwardContent({
+      cfg,
+      messageId: ctx.messageId,
+      chatId: ctx.chatId,
+      rawContent: event.message.content,
+      log,
+    });
+    ctx = { ...ctx, content: mergeContent };
+  }
 
   log(`feishu: received message from ${ctx.senderOpenId} in ${ctx.chatId} (${ctx.chatType})`);
 
